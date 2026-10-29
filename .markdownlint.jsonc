@@ -1,0 +1,12 @@
+{
+  // Rules as in dotfiles-mac, so that the two repositories' prose reads alike.
+  // Line length: prose in ADRs and tables regularly exceeds 80.
+  "MD013": false,
+  // Inline HTML: allowed for occasional table formatting.
+  "MD033": false,
+  // First line heading: skill files and issue templates start with YAML
+  // frontmatter.
+  "MD041": false,
+  // Table column style: off, as in dotfiles-mac, whose ADRs predate the rule.
+  "MD060": false
+}

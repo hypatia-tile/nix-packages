@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# The jobs mirror dotfiles-mac's that apply here (ADR 0001). Every command
+# lives in a bin/check-*.sh script, which the Git hooks and preflight run too;
+# a job only supplies the machine and the devShell that pins the tools.
+
+jobs:
+  changes:
+    name: Detect closure-affecting changes
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.gates.outputs.build }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Ask the flake check whether the change concerns it
+        # check-flake.sh --applies decides from the changed files. A change to
+        # this workflow, or a push to main, runs it regardless.
+        id: gates
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          build=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            mapfile -t files < <(git diff --name-only --no-renames "$BASE...$HEAD")
+            printf '%s\n' "${files[@]}"
+            if ! printf '%s\n' "${files[@]}" | grep -qxF .github/workflows/ci.yml; then
+              rc=0
+              [ "${#files[@]}" -gt 0 ] && bin/check-flake.sh --applies "${files[@]}" || rc=$?
+              case $rc in
+                0) ;;
+                1) build=false ;;
+                *) echo "::error::check-flake.sh --applies exited $rc"; exit 1 ;;
+              esac
+            fi
+          fi
+          echo "build: $build"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  flake:
+    name: Flake check & package build
+    runs-on: macos-15
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.build == 'true'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        # A single-user store, so that the cache below can be restored into it
+        # (dotfiles-mac#185).
+        uses: nixbuild/nix-quick-install-action@v35
+        with:
+          nix_conf: |
+            # hypatia-emacs carries emacs-flake's patched Emacs, which is not in
+            # cache.nixos.org; without it this job builds Emacs from source.
+            extra-substituters = https://nix-community.cachix.org https://hypatia-emacs.cachix.org
+            extra-trusted-public-keys = nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs= hypatia-emacs.cachix.org-1:01hQJcXQlX0AFv1UpAL7v9zQNhoDT0bJzoNaAzABEzQ=
+
+      - name: Restore and save Nix store
+        # The Neovim nightly overlay is built against this nixpkgs, so no
+        # binary cache carries it: the store is cached per lock instead.
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-single-user-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-single-user-${{ runner.os }}-
+          gc-max-store-size-macos: 4G
+
+      - name: Flake check, which builds the check system (never switch)
+        run: bin/check-flake.sh
+
+  nix-lint:
+    name: Nix format & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: nixfmt, deadnix, statix
+        run: nix develop --no-update-lock-file -c bin/check-nix.sh
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: gitleaks
+        # Every commit HEAD reaches: on a pull request that is the merge
+        # commit, so the base's history and the branch's commits both.
+        run: nix develop --no-update-lock-file -c bin/check-secrets.sh
+
+  hygiene:
+    name: Docs & commit hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: markdownlint
+        run: nix develop --no-update-lock-file -c bin/check-markdown.sh
+
+      - name: shellcheck
+        run: nix develop --no-update-lock-file -c bin/check-shell.sh
+
+      - name: Stray closing tags
+        run: bin/check-stray-tags.sh
+
+      - name: commitlint
+        # On a pull request: the branch's commits and the title, which becomes
+        # the squash commit's subject. On main: what landed. The title goes
+        # through env, never into the script text.
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          nix develop --no-update-lock-file -c bin/check-commits.sh "$BASE" "$HEAD"
+          if [ "$EVENT" = pull_request ]; then
+            printf '%s\n' "$TITLE" | nix develop --no-update-lock-file -c bin/check-commits.sh --message -
+          fi
+
+      - name: Locked inputs do not ride along with other changes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: nix develop --no-update-lock-file -c bin/check-lock.sh "$BASE" "$HEAD"
+
+      - name: Agent guard decides as expected
+        # jq and python3 come from the devShell.
+        run: nix develop --no-update-lock-file -c bin/check-agent-guard.sh

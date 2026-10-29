@@ -1,0 +1,753 @@
+#!/usr/bin/env bash
+# Pre-tool-use guard for every agent working in this repository (ADR 0001).
+#
+# A copy of dotfiles-mac's bin/agent-guard.sh (dotfiles-mac ADR 0027), less
+# its rule for that repository's two archived legacy repositories, which has
+# no counterpart here. A fix to one copy is a candidate for the other; the
+# references below are dotfiles-mac's unless they say otherwise.
+#
+# Registered as a project hook for Claude Code (.claude/settings.json) and
+# Codex (.codex/hooks.json); cursor-agent reads the Claude registration, and
+# so does the Cursor desktop app's agent (measured on 3.24.12 for git push
+# only; dotfiles-mac#219 records it). The
+# deny list below is the only place the AGENTS.md hard rules are enforced as
+# code — .claude/settings.json keeps a subset as a second layer for Claude.
+#
+# Reads the hook's JSON on stdin. Allowing prints nothing: answering "allow"
+# would skip the agent's own permission prompt, which is not ours to skip.
+# Denying and asking print exactly one object, {"hookSpecificOutput": {...}},
+# and nothing else. That is measured, not a style choice: Codex validates the
+# output with additionalProperties false, so a single extra key made it treat
+# a denial as invalid output and run the command anyway. cursor-agent
+# translates this Claude-form answer itself.
+#
+# Codex has no "ask" ("unsupported permissionDecision:ask"), so a call that
+# would ask is allowed there and left to Codex's own approval flow (dotfiles-mac ADR 0027).
+#
+# Decides from what the call carries, not what the tool is called: a `command`
+# is analysed as shell, and a path accompanied by content to write is a write.
+# A guarded call it cannot parse is denied, and so is any error of its own —
+# Claude Code and Codex treat a crashing hook as non-blocking, so failing
+# closed has to be done here rather than left to the agent.
+#
+# Usage: <hook JSON on stdin> | bin/agent-guard.sh
+# Exit:  always 0; the decision is in the output.
+set -uo pipefail
+
+deny() {
+  local reason=${1//\\/\\\\}
+  reason=${reason//\"/\\\"}
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"agent-guard: %s"}}\n' "$reason"
+  exit 0
+}
+
+input=$(mktemp "${TMPDIR:-/tmp}/agent-guard.XXXXXX") || deny "could not create a temporary file"
+trap 'rm -f "$input"' EXIT
+trap 'deny "internal error; refusing rather than failing open"' ERR
+cat >"$input"
+
+command -v python3 >/dev/null 2>&1 || deny "python3 is not available, so the call cannot be checked"
+
+read -r -d '' GUARD <<'PY' || true
+import json, os, re, shlex, sys
+
+HOME = os.path.expanduser("~")
+WRAPPERS = {"command", "exec", "nohup", "time", "nice", "caffeinate", "xargs", "env", "builtin"}
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+SEPARATORS = {";", "&&", "||", "|", "&", "|&", "(", ")", "\n", ";;"}
+# shlex joins adjacent operator characters into one token, so `f(){`, `|(` and
+# `);` arrive as "()", "|(" and ");". Any token made only of these characters
+# separates commands, or a command after it went unchecked (dotfiles-mac#210).
+OPERATOR = re.compile(r"^[;&|()]+$")
+# Reserved words that open a compound command and are followed by a command:
+# the guard reads past them as it reads past a wrapper. Without this,
+# `if x; then git push; fi`, `{ git push; }` and every function body were
+# decided by the reserved word, which is not a command, and allowed (dotfiles-mac#210).
+RESERVED = {"{", "!", "if", "then", "else", "elif", "do", "while", "until", "coproc"}
+# Output redirections that name a file: >, >>, >|, &>, &>>, and >& when its
+# target is not a file descriptor.
+REDIRECT_OUT = re.compile(r"^(?:&>>?|>>?\|?|>&)$")
+WRITE_ANY_ARG = {"rm", "rmdir", "touch", "mkdir", "chmod", "chown", "chflags", "truncate", "tee", "unlink", "mv"}
+WRITE_DEST_ARG = {"cp", "ln", "install", "rsync", "ditto"}
+PLACEHOLDER = "__agent_guard_substitution__"
+CONTENT_FIELDS = ("content", "new_string", "edits", "new_source", "old_string")
+# The variables the pinned Lefthook (2.1.14) reads that make it skip work:
+# LEFTHOOK=0|false disables it, LEFTHOOK_EXCLUDE drops commands by name, and
+# LEFTHOOK_CONFIG swaps in another config. The others it reads (_OUTPUT,
+# _VERBOSE, _BIN) change only what is printed or which binary runs (dotfiles-mac ADR 0032).
+HOOK_SKIP_VARS = {"LEFTHOOK", "LEFTHOOK_EXCLUDE", "LEFTHOOK_CONFIG"}
+DECLARERS = {"export", "declare", "typeset", "readonly", "local"}
+ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+HOOKS_RULE = "the Git hooks run the gates and are never bypassed by an agent; report a refused commit instead (dotfiles-mac ADR 0032)"
+# gh reaches the remote the way `git push` does, so it is sorted the same way
+# (dotfiles-mac#149). What the workflows need is allowed: reading, and authoring PRs and
+# issues (ship-pr, the roadmap issues). What merges, publishes or changes the
+# repository is the owner's and refused, as push is. Anything on neither list
+# asks, so a verb gh adds later, or an alias, is never allowed by default.
+# None means every verb of that command.
+GH_ALLOWED = {
+    "pr": {"view", "list", "status", "checks", "diff", "checkout", "create", "edit", "comment", "ready"},
+    "issue": {"view", "list", "status", "create", "comment", "edit", "close", "reopen"},
+    "run": {"view", "list", "watch", "download", "rerun"},
+    "workflow": {"view", "list"},
+    "repo": {"view", "list", "clone"},
+    "release": {"view", "list", "download"},
+    "label": {"list"},
+    "cache": {"list"},
+    "secret": {"list"},
+    "variable": {"list", "get"},
+    "auth": {"status"},
+    "search": None,
+    "status": None,
+    "browse": None,
+}
+GH_OWNER = {
+    "pr": {"merge"},
+    "repo": {"create", "delete", "edit", "archive", "unarchive", "rename", "sync", "fork", "deploy-key"},
+    "release": {"create", "delete", "edit", "upload", "delete-asset"},
+    "workflow": {"run", "enable", "disable"},
+    "secret": {"set", "delete"},
+    "variable": {"set", "delete"},
+}
+GH_RULE = "the owner pushes and merges; agents never change the remote repository (AGENTS.md, dotfiles-mac ADR 0008)"
+
+class Refuse(Exception):
+    pass
+
+class Ask(Exception):
+    pass
+
+def hook_path(path, cwd):
+    """Whether writing PATH would change which hooks run, or what they run.
+
+    The hook stubs (.githooks/), Git's own hook directory (.git/hooks/), the
+    repository config that holds core.hooksPath (.git/config), and Lefthook's
+    local override: lefthook-local.* is untracked, so a `skip:` written there
+    turns a gate off without anything showing in a diff. Matched in any
+    repository, not only this one: the path is all the guard can see.
+    """
+    if not path:
+        return False
+    p = os.path.expanduser(os.path.expandvars(path))
+    if not os.path.isabs(p):
+        p = os.path.join(cwd, p)
+    parts = os.path.normpath(p).split(os.sep)
+    if ".githooks" in parts:
+        return True
+    for i, part in enumerate(parts[:-1]):
+        if part == ".git" and parts[i + 1] in ("hooks", "config"):
+            return True
+    return bool(re.match(r"^\.?lefthook-local(\.|$)", parts[-1]))
+
+def check_assignment(word):
+    m = ASSIGNMENT.match(word)
+    if not m:
+        return
+    name, value = m.group(1), m.group(2)
+    if name in HOOK_SKIP_VARS:
+        raise Refuse("setting %s makes Lefthook skip the gates; %s" % (name, HOOKS_RULE))
+    if name == "GIT_CONFIG_PARAMETERS" and "hookspath" in value.lower():
+        raise Refuse("GIT_CONFIG_PARAMETERS would change core.hooksPath; %s" % HOOKS_RULE)
+    if re.match(r"^GIT_CONFIG_KEY_[0-9]+$", name) and value.strip().lower() == "core.hookspath":
+        raise Refuse("%s would change core.hooksPath; %s" % (name, HOOKS_RULE))
+
+def check_assignments(argv):
+    """Assignments before a command, after `env`, or made by a declarer.
+
+    unwrap() discards these to find the command, so they are read first. A
+    bare `LEFTHOOK=0` statement counts too: a later `export LEFTHOOK` or a
+    command in the same shell would see it.
+    """
+    for word in argv:
+        name = os.path.basename(word)
+        if ASSIGNMENT.match(word):
+            check_assignment(word)
+        elif name in WRAPPERS or word.startswith("-"):
+            continue
+        elif name in DECLARERS:
+            for arg in argv[argv.index(word) + 1:]:
+                check_assignment(arg)
+                if arg in HOOK_SKIP_VARS:
+                    raise Refuse("exporting %s makes Lefthook skip the gates; %s" % (arg, HOOKS_RULE))
+            return
+        else:
+            return
+
+def no_verify(arg):
+    """`--no-verify` or an abbreviation Git accepts for it.
+
+    Git takes any unambiguous prefix of a long option. `--no-ver` is ambiguous
+    with `--no-verbose` and fails on its own; `--no-veri` onwards is not. A
+    longer option such as `--no-verify-signatures` is a different one.
+    """
+    return len(arg) >= len("--no-veri") and "--no-verify".startswith(arg)
+
+def commit_skips_hooks(args):
+    """`git commit` with -n, alone or in a cluster such as -anm."""
+    takes_value = set("mFCct")
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            return False
+        if no_verify(a):
+            return True
+        if a.startswith("--") or not a.startswith("-") or a == "-":
+            continue
+        for j, ch in enumerate(a[1:]):
+            if ch == "n":
+                return True
+            if ch in takes_value:
+                if j == len(a) - 2:
+                    i += 1
+                break
+    return False
+
+def config_changes_hooks_path(args):
+    """`git config` that writes core.hooksPath, in either syntax.
+
+    A read (`git config core.hooksPath`, `--get`, `get`) is allowed. `--edit`
+    is refused whatever the key: the editor can change anything.
+    """
+    if args[:1] == ["edit"] or "--edit" in args or "-e" in args:
+        return True
+    if not any(a.lower() == "core.hookspath" for a in args):
+        return False
+    if args[:1] in (["set"], ["unset"]):
+        return True
+    if any(a in ("--unset", "--unset-all", "--add", "--replace-all") for a in args):
+        return True
+    with_value = {"-f", "--file", "--blob", "--type", "--default", "--comment", "--value"}
+    operands, rest = [], list(args)
+    if rest[:1] == ["get"]:
+        return False
+    while rest:
+        a = rest.pop(0)
+        if a in with_value and rest:
+            rest.pop(0)
+        elif not a.startswith("-"):
+            operands.append(a)
+    return len(operands) >= 2
+
+def gh_api_writes(args):
+    """Whether `gh api ARGS` changes something on the remote.
+
+    gh picks the method itself: GET, unless a field or --input is given, which
+    makes it POST. An explicit -X/--method wins. GraphQL is always POST, so
+    there it is the query that decides: a mutation writes, and a query read
+    from a file (`query=@file`, --input) cannot be seen and is refused.
+    """
+    with_value = {"-H", "--header", "-q", "--jq", "-t", "--template", "--cache", "-p", "--preview", "--hostname"}
+    field = re.compile(r"^(?:-[fF]|--field|--raw-field)(?:=?(.*))?$", re.S)
+    method, body, endpoint, rest = None, [], None, list(args)
+    while rest:
+        a = rest.pop(0)
+        m = re.match(r"^(?:-X|--method)(?:=?(.+))?$", a)
+        f = field.match(a)
+        if m:
+            method = m.group(1) or (rest.pop(0) if rest else "")
+        elif f:
+            body.append(f.group(1) or (rest.pop(0) if rest else ""))
+        elif a == "--input" or a.startswith("--input="):
+            body.append("@" + (a[len("--input="):] if "=" in a else (rest.pop(0) if rest else "")))
+        elif a in with_value:
+            if rest:
+                rest.pop(0)
+        elif not a.startswith("-") and endpoint is None:
+            endpoint = a
+    if endpoint == "graphql":
+        return any(v.split("=", 1)[-1].startswith("@") or re.search(r"\bmutation\b", v) for v in body)
+    method = (method or ("POST" if body else "GET")).upper()
+    return method not in ("GET", "HEAD")
+
+def check_gh(args, state):
+    words, rest = [], list(args)
+    while rest and len(words) < 2:
+        a = rest.pop(0)
+        if a in ("-R", "--repo", "--hostname"):
+            if rest:
+                rest.pop(0)
+        elif not a.startswith("-"):
+            words.append(a)
+    group = words[0] if words else ""
+    verb = words[1] if len(words) > 1 else ""
+    if group == "api":
+        if gh_api_writes(args[args.index("api") + 1:]):
+            raise Refuse("gh api with a write method; %s" % GH_RULE)
+        return
+    if group == "auth" and verb == "token":
+        raise Refuse("gh auth token prints a secret, and secrets are never read (AGENTS.md, dotfiles-mac ADR 0009)")
+    if verb in GH_OWNER.get(group, ()):
+        raise Refuse("gh %s %s; %s" % (group, verb, GH_RULE))
+    if group in GH_ALLOWED and (GH_ALLOWED[group] is None or verb in GH_ALLOWED[group]):
+        return
+    state["ask"] = "gh %s is neither read-only nor PR or issue authoring, so the owner decides (AGENTS.md)" % " ".join(words)
+
+def strip_heredocs(text):
+    """Remove heredoc bodies, returning (text, bodies fed to a shell)."""
+    lines = text.split("\n")
+    out, shell_bodies, expanding, i = [], [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        m = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", line)
+        if m:
+            delim = m.group(2)
+            body = []
+            i += 1
+            while i < len(lines) and lines[i].strip() != delim:
+                body.append(lines[i])
+                i += 1
+            # The body is shell only when the command receiving it is a shell:
+            # `bash <<EOF` runs it, `git commit -F - <<EOF` merely reads it.
+            segment = re.split(r"&&|\|\||[;|&(]", line[: m.start()])[-1].split()
+            words = unwrap(segment)
+            if words and os.path.basename(words[0]) in SHELLS:
+                shell_bodies.append("\n".join(body))
+            elif not m.group(1):
+                # An unquoted delimiter expands $(...) in the body even when
+                # the receiver is not a shell: `cat <<EOF` runs them.
+                expanding.append("\n".join(body))
+        i += 1
+    return "\n".join(out), shell_bodies, expanding
+
+def normalise(script):
+    """Drop comments and turn unquoted newlines into `;`, quote-aware.
+
+    shlex cannot be trusted with either. Its commenter starts a comment at a
+    `#` in the middle of a word, so `nix build .#host && git push` loses the
+    push; and a comment swallows the newline that separated the next command.
+    Both failed open before this pass existed.
+    """
+    out, i, n, quote = [], 0, len(script), None
+    while i < n:
+        c = script[i]
+        if quote == "'":
+            out.append(c)
+            if c == "'":
+                quote = None
+        elif quote == '"':
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(script[i + 1])
+                i += 1
+            elif c == '"':
+                quote = None
+        elif c == "\\" and i + 1 < n:
+            if script[i + 1] == "\n":
+                i += 1
+            else:
+                out.append(c)
+                out.append(script[i + 1])
+                i += 1
+        elif c in "'\"":
+            quote = c
+            out.append(c)
+        # The last character, not the last element: a newline is appended
+        # as " ; ", which is not a member of the string below (dotfiles-mac#245).
+        elif c == "#" and (not out or out[-1][-1:] in " \t\r\n;&|()"):
+            while i < n and script[i] != "\n":
+                i += 1
+            continue
+        elif c == "\n":
+            out.append(" ; ")
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+def tokenize(script):
+    lex = shlex.shlex(normalise(script), posix=True, punctuation_chars=";&|()<>")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        return list(lex)
+    except ValueError as e:
+        raise Refuse("the shell command could not be parsed (%s)" % e)
+
+def simple_commands(tokens):
+    """Yield (argv, piped): each simple command, and whether a pipe feeds it."""
+    cmd, piped = [], False
+    for t in tokens:
+        if t in SEPARATORS or OPERATOR.match(t):
+            if cmd:
+                yield cmd, piped
+                piped = False
+            cmd = []
+            if t.rstrip("(") in ("|", "|&"):
+                piped = True
+            elif t != "(":
+                piped = False
+        else:
+            cmd.append(t)
+    if cmd:
+        yield cmd, piped
+
+def end_of_substitution(script, start):
+    """Index just past the `)` closing the `$(` whose body starts at `start`.
+
+    Quote-aware, because the body is shell wherever it appears: a parenthesis
+    inside quotes is text, not structure. Counting every parenthesis ended
+    `$(jq -r '"\\(.name)"')` at the `)` inside the jq filter, and the quote
+    left over then made tokenize() raise "No closing quotation" — a command
+    the rules allow, refused, because unparseable input denies (dotfiles-mac#124). A
+    backslash escapes outside single quotes, where it is literal.
+    """
+    depth, i, n, quote = 1, start, len(script), None
+    while i < n and depth:
+        c = script[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+        elif quote == '"':
+            if c == "\\":
+                i += 1
+            elif c == "$" and script[i + 1:i + 2] == "(":
+                # A nested substitution inside double quotes is parsed as shell
+                # in its own right, so its quotes are its own: in
+                # `$(echo "$(echo '")"')")` the `"` inside the inner filter does
+                # not end the outer string.
+                i = end_of_substitution(script, i + 2)
+                continue
+            elif c == '"':
+                quote = None
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        i += 1
+    if depth:
+        raise Refuse("an unterminated $( in the shell command")
+    return i
+
+def substitutions(script, heredoc=False):
+    """Command substitutions the shell would run, read from the raw text.
+
+    Found before shlex removes the quoting that decides whether they run: in
+    single quotes `$(...)` is literal, and in double quotes an escaped \\`
+    is a literal backtick. Reading tokens after shlex could see neither, so
+    `grep "only \\`link\\`"` was parsed as a substitution and refused. An
+    unquoted heredoc body expands like double quotes, where `'` is literal.
+
+    Returns the substitutions and the text with each one replaced by a single
+    placeholder word. The caller tokenises that text, not the original: shlex
+    splits an unquoted `$(...)` at its parentheses, so `A=$(pwd)/activate` read
+    as a command named `/activate` and was refused.
+    """
+    found, masked, i, n, quote = [], [], 0, len(script), None
+    while i < n:
+        c = script[i]
+        if quote == "'":
+            masked.append(c)
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if c == "\\":
+            masked.append(script[i:i + 2])
+            i += 2
+            continue
+        if not heredoc and c == "'" and quote is None:
+            quote = "'"
+        elif not heredoc and c == '"':
+            quote = None if quote == '"' else '"'
+        elif c == "$" and script[i + 1:i + 2] == "(":
+            j = end_of_substitution(script, i + 2)
+            found.append(script[i + 2:j - 1])
+            masked.append(PLACEHOLDER)
+            i = j
+            continue
+        elif not heredoc and quote is None and c in "<>" and script[i + 1:i + 2] == "(":
+            # Process substitution runs its body as `$(...)` does, and leaves a
+            # path in its place: `cat <(sudo true)` was allowed (dotfiles-mac#210).
+            j = end_of_substitution(script, i + 2)
+            found.append(script[i + 2:j - 1])
+            masked.append(PLACEHOLDER)
+            i = j
+            continue
+        elif c == "`":
+            j = i + 1
+            while j < n and script[j] != "`":
+                j += 2 if script[j] == "\\" else 1
+            if j >= n:
+                raise Refuse("an unterminated backtick in the shell command")
+            found.append(script[i + 1:j].replace("\\`", "`"))
+            masked.append(PLACEHOLDER)
+            i = j + 1
+            continue
+        masked.append(c)
+        i += 1
+    return found, "".join(masked)
+
+def unwrap(argv):
+    while argv:
+        name = os.path.basename(argv[0])
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
+            argv = argv[1:]
+        elif argv[0] in RESERVED:
+            # `coproc NAME { ...; }` names the coprocess before its body.
+            if argv[0] == "coproc" and len(argv) > 2 and argv[2] == "{":
+                argv = argv[1:]
+            argv = argv[1:]
+        elif argv[0] == "function":
+            # `function f { ...; }`: the body is checked where it is defined,
+            # whether or not it is ever called (dotfiles-mac#210).
+            argv = argv[2:]
+        elif name in WRAPPERS:
+            argv = argv[1:]
+            while argv and (argv[0].startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0])):
+                argv = argv[1:]
+        else:
+            break
+    return argv
+
+def check_argv(argv, state):
+    check_assignments(argv)
+    argv = unwrap(argv)
+    if not argv:
+        return
+    name = os.path.basename(argv[0])
+    args = argv[1:]
+    cwd = state["cwd"]
+
+    if name in ("sudo", "doas"):
+        raise Refuse("sudo is never run by an agent; hand the step to the owner for a real terminal (AGENTS.md)")
+    if name in SHELLS:
+        check_shell_invocation(args, state)
+    if name in ("source", ".") and args:
+        check_script_file(args[0], state)
+    if name == "eval":
+        check_shell(" ".join(args), state)
+    if name == "cd":
+        target = args[0] if args else HOME
+        target = os.path.expanduser(os.path.expandvars(target))
+        state["cwd"] = os.path.realpath(target if os.path.isabs(target) else os.path.join(cwd, target))
+        return
+    if name == "darwin-rebuild" and any(a in ("switch", "activate") for a in args):
+        raise Refuse("darwin-rebuild %s is the owner's manual step; agents are build-only (dotfiles-mac ADR 0003, dotfiles-mac ADR 0015)" % next(a for a in args if a in ("switch", "activate")))
+    if name in ("activate", "activate-user") or (name == "home-manager" and "switch" in args):
+        raise Refuse("activation scripts are never run by an agent (AGENTS.md)")
+    if name == "nix" and len(args) >= 2 and args[0] == "flake" and args[1] == "update":
+        raise Refuse("flake.lock moves only in dedicated commits; nix flake update is not run ad hoc (dotfiles-mac ADR 0011)")
+
+    if name == "git":
+        repo, rest = cwd, list(args)
+        while rest and rest[0].startswith("-"):
+            opt = rest.pop(0)
+            if opt == "-C" and rest:
+                d = os.path.expanduser(rest.pop(0))
+                repo = os.path.realpath(d if os.path.isabs(d) else os.path.join(repo, d))
+            elif opt == "-c" and rest:
+                if rest.pop(0).split("=", 1)[0].strip().lower() == "core.hookspath":
+                    raise Refuse("git -c core.hooksPath=... runs other hooks than the gates; %s" % HOOKS_RULE)
+            elif opt.startswith("--config-env") and "hookspath" in opt.lower():
+                raise Refuse("git --config-env core.hooksPath runs other hooks than the gates; %s" % HOOKS_RULE)
+            elif opt == "--config-env" and rest:
+                if "hookspath" in rest.pop(0).lower():
+                    raise Refuse("git --config-env core.hooksPath runs other hooks than the gates; %s" % HOOKS_RULE)
+            elif opt in ("--git-dir", "--work-tree") and rest:
+                rest.pop(0)
+        sub = rest[0] if rest else ""
+        subargs = rest[1:]
+        if sub == "push":
+            raise Refuse("git push is the owner's; agents never push (AGENTS.md, dotfiles-mac ADR 0008)")
+        if any(no_verify(a) for a in subargs) or (sub == "commit" and commit_skips_hooks(subargs)):
+            raise Refuse("git %s without its hooks; %s" % (sub, HOOKS_RULE))
+        if sub == "config" and config_changes_hooks_path(subargs):
+            raise Refuse("git config would change core.hooksPath; %s" % HOOKS_RULE)
+        if sub in ("rm", "mv") and any(hook_path(a, repo) for a in subargs if not a.startswith("-")):
+            raise Refuse("git %s on the hooks or their config; %s" % (sub, HOOKS_RULE))
+        # A commit that runs the hooks is allowed without asking (dotfiles-mac ADR 0036).
+        return
+
+    if name == "gh":
+        check_gh(args, state)
+        return
+
+    targets = []
+    if name in WRITE_ANY_ARG:
+        targets = [a for a in args if not a.startswith("-")]
+    elif name in WRITE_DEST_ARG:
+        operands = [a for a in args if not a.startswith("-")]
+        targets = operands[-1:]
+    elif name in ("sed", "perl") and any(re.match(r"^-[a-zA-Z]*i", a) for a in args):
+        targets = [a for a in args if not a.startswith("-")][1:]
+    for t in targets:
+        state["written"].add(resolve(t, cwd))
+        if hook_path(t, cwd):
+            raise Refuse("%s would change the Git hooks or their config; %s" % (name, HOOKS_RULE))
+
+def resolve(path, cwd):
+    p = os.path.expanduser(os.path.expandvars(path))
+    return os.path.realpath(p if os.path.isabs(p) else os.path.join(cwd, p))
+
+def check_script_file(path, state):
+    """A script the shell reads from a file: `source F`, `. F`, `bash F`.
+
+    The guard cannot read a script that the same command writes first, nor
+    one whose path is generated, so either is refused as undecidable (dotfiles-mac#210).
+    A file that already exists is not opened: the guard does not follow
+    `./script.sh` either, and reading whole scripts would refuse every one
+    whose syntax its parser does not cover.
+    """
+    if PLACEHOLDER in path:
+        raise Refuse("a shell script read from a generated path or a process substitution cannot be checked")
+    if resolve(path, state["cwd"]) in state["written"]:
+        raise Refuse("a shell script written earlier in the same command cannot be checked")
+
+def check_shell_invocation(args, state):
+    """`bash [options] -c STRING`, `bash [options] FILE`, or a script on stdin.
+
+    Options may come before `-c` (`bash -e -c`, `bash --norc -c`), and `-c`
+    may be in a cluster (`-lc`). With `-c`, every operand is checked as shell:
+    the first is the script and the rest are its arguments, which are usually
+    harmless words, and checking them too cannot fail open.
+    """
+    with_value = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+    command_string = reads_stdin = False
+    operands, rest = [], list(args)
+    while rest:
+        a = rest.pop(0)
+        if operands:
+            operands.append(a)
+        elif a == "--":
+            operands.extend(rest)
+            break
+        elif a == "-":
+            reads_stdin = True
+        elif a in with_value:
+            if rest:
+                rest.pop(0)
+        elif re.match(r"^[-+][A-Za-z]+$", a):
+            command_string = command_string or "c" in a[1:]
+            reads_stdin = reads_stdin or "s" in a[1:]
+        elif a.startswith("--"):
+            continue
+        else:
+            operands.append(a)
+    if command_string:
+        for operand in operands:
+            check_shell(operand, state)
+    elif operands and not reads_stdin:
+        check_script_file(operands[0], state)
+    elif state.get("piped"):
+        raise Refuse("a shell reading its script from a pipe cannot be checked")
+    elif state.get("stdin"):
+        check_script_file(state["stdin"], state)
+
+def check_shell(script, state):
+    script, bodies, expanding = strip_heredocs(script)
+    for body in bodies:
+        check_shell(body, state)
+    for body in expanding:
+        for inner in substitutions(body, heredoc=True)[0]:
+            check_shell(inner, state)
+    inners, script = substitutions(normalise(script))
+    for inner in inners:
+        check_shell(inner, state)
+    tokens = tokenize(script)
+    for argv, piped in simple_commands(tokens):
+        words, stdin, here, i = [], None, None, 0
+        while i < len(argv):
+            t = argv[i]
+            target = argv[i + 1] if i + 1 < len(argv) else None
+            if REDIRECT_OUT.match(t) or t in ("<", "<<", "<<<", "<<-", "<>"):
+                i += 2
+                if target is None or (t == ">&" and re.match(r"^(?:[0-9]+|-)$", target)):
+                    continue
+                if t in ("<", "<>"):
+                    stdin = target
+                elif t == "<<<":
+                    here = target
+                elif not t.startswith("<"):
+                    if hook_path(target, state["cwd"]):
+                        raise Refuse("output redirection into the Git hooks or their config; %s" % HOOKS_RULE)
+                    state["written"].add(resolve(target, state["cwd"]))
+                continue
+            words.append(t)
+            i += 1
+        shell = unwrap(list(words))
+        if here is not None and shell and os.path.basename(shell[0]) in SHELLS:
+            check_shell(here, state)
+        state["piped"], state["stdin"] = piped, stdin
+        check_argv(words, state)
+        state["piped"] = state["stdin"] = None
+
+def patch_paths(text):
+    return re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$", text, re.M)
+
+def decide(data):
+    if not isinstance(data, dict):
+        raise Refuse("the hook input is not a JSON object")
+    ti = data.get("tool_input")
+    if not isinstance(ti, dict):
+        ti = {}
+    # cursor-agent sends cwd as an empty string and names the workspace instead.
+    roots = data.get("workspace_roots")
+    cwd = data.get("cwd") or (roots[0] if isinstance(roots, list) and roots and isinstance(roots[0], str) else "") or os.getcwd()
+    state = {"cwd": os.path.realpath(cwd), "ask": None, "written": set(), "piped": None, "stdin": None}
+
+    command = ti.get("command", data.get("command"))
+    # Codex's apply_patch carries the patch text in `command`. It is checked as
+    # a patch below; parsing it as shell would refuse any patch with a quote.
+    if isinstance(command, str) and command.lstrip().startswith("*** Begin Patch"):
+        command = None
+    if command is not None:
+        if isinstance(command, list) and all(isinstance(c, str) for c in command):
+            check_argv(command, state)
+        elif isinstance(command, str):
+            check_shell(command, state)
+        else:
+            raise Refuse("the command field has an unexpected shape")
+
+    path = ti.get("file_path", ti.get("notebook_path", ti.get("path")))
+    writes = any(k in ti for k in CONTENT_FIELDS)
+    if path is not None and writes:
+        if not isinstance(path, str):
+            raise Refuse("the file path has an unexpected shape")
+        if hook_path(path, state["cwd"]):
+            raise Refuse("writing the Git hooks or their config; %s" % HOOKS_RULE)
+    for value in ti.values():
+        if isinstance(value, str) and "*** Begin Patch" in value:
+            for groups in patch_paths(value):
+                p = groups[0] or groups[1]
+                if hook_path(p.strip(), state["cwd"]):
+                    raise Refuse("a patch that writes the Git hooks or their config; %s" % HOOKS_RULE)
+
+    # Codex rejects "ask"; its input is the one carrying turn_id without
+    # cursor_version. Claude Code and cursor-agent both honour it.
+    codex = "turn_id" in data and "cursor_version" not in data
+    if state["ask"] and not codex:
+        raise Ask(state["ask"])
+
+def emit(decision, reason):
+    reason = "agent-guard: " + reason
+    print(json.dumps({
+        "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision, "permissionDecisionReason": reason},
+    }))
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        raw = f.read()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise Refuse("the hook input is not valid JSON")
+    decide(data)
+except Refuse as r:
+    emit("deny", str(r))
+except Ask as a:
+    emit("ask", str(a))
+except Exception as e:
+    emit("deny", "internal error (%s); refusing rather than failing open" % type(e).__name__)
+PY
+
+trap - ERR
+python3 -c "$GUARD" "$input" || deny "the checker exited abnormally; refusing rather than failing open"
+exit 0

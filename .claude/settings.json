@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(darwin-rebuild switch:*)",
+      "Bash(darwin-rebuild activate:*)",
+      "Bash(sudo darwin-rebuild:*)",
+      "Bash(git push:*)",
+      "Bash(nix flake update:*)"
+    ],
+    "allow": [
+      "Bash(nix flake check:*)",
+      "Bash(nix build:*)",
+      "Bash(nix eval:*)",
+      "Bash(nix store diff-closures:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git branch:*)",
+      "Bash(git commit:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/bin/agent-guard.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

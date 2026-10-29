@@ -1,0 +1,9 @@
+{
+  // Nix build-output symlinks: the '**/*.md' glob would otherwise descend into
+  // a closure and lint vendored Markdown. `ignores` is only read from a
+  // `.markdownlint-cli2.*` file; rules stay in `.markdownlint.jsonc`.
+  //
+  // .codex/skills holds symlinks to .claude/skills, so linting it reports every
+  // skill's findings twice.
+  "ignores": ["result/**", "result-*/**", ".codex/skills/**"]
+}
