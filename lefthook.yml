@@ -1,0 +1,53 @@
+# Which Git hook stage runs which check (ADR 0001, after dotfiles-mac
+# ADR 0032). This file holds only that mapping. Every command lives in a
+# bin/check-*.sh script, which CI and preflight call too, and every check
+# decides for itself which files concern it. So nothing here declares a glob.
+#
+# The hooks are the tracked stubs in .githooks/, installed by the owner with
+# `git config core.hooksPath .githooks`. Each stub enters the default
+# devShell and calls `lefthook run <hook>`.
+#
+# Files reach a check through bin/lib/hook-files.sh, not through {staged_files}
+# or {push_files}: Lefthook's lists drop deleted paths, and a deleted file must
+# still put its checks in scope (that script's header has the measurement).
+
+# With core.hooksPath set, `lefthook run` refuses to re-install hooks anyway;
+# this says so explicitly and silences the warning on every commit.
+no_auto_install: true
+
+pre-commit:
+  commands:
+    nix:
+      run: bin/lib/hook-files.sh staged bin/check-nix.sh
+    markdown:
+      run: bin/lib/hook-files.sh staged bin/check-markdown.sh
+    shell:
+      run: bin/lib/hook-files.sh staged bin/check-shell.sh
+    stray-tags:
+      run: bin/lib/hook-files.sh staged bin/check-stray-tags.sh
+    agent-guard:
+      run: bin/lib/hook-files.sh staged bin/check-agent-guard.sh
+    # Outside the file contract, like secrets below. At commit time it refuses
+    # a commit on main; under preflight's whole-tree run it asks instead
+    # whether local main holds commits that origin/main does not.
+    branch:
+      run: if [ "$HOOK_FILES" = all ]; then bin/check-branch.sh; else bin/check-branch.sh --commit; fi
+    # Outside the file contract too: at commit time it judges the staged
+    # commit, and under the whole-tree run each commit since origin/main.
+    lock:
+      run: if [ "$HOOK_FILES" = all ]; then bin/check-lock.sh; else bin/check-lock.sh --staged; fi
+    # Outside the file contract, so bin/lib/hook-files.sh cannot widen it.
+    # Under preflight's whole-tree run (HOOK_FILES=all) it scans every commit
+    # HEAD reaches, as CI's Secret scan job does, instead of the staged diff.
+    secrets:
+      run: if [ "$HOOK_FILES" = all ]; then bin/check-secrets.sh; else bin/check-secrets.sh --staged; fi
+
+commit-msg:
+  commands:
+    commitlint:
+      run: bin/check-commits.sh --message {1}
+
+pre-push:
+  commands:
+    flake:
+      run: bin/lib/hook-files.sh pushed bin/check-flake.sh

@@ -1,0 +1,31 @@
+# Weekly flake.lock update PRs (ADR 0001). Merging is always manual, by
+# rebase, after the lock-review skill; a host takes the new lock only when its
+# own repository moves its nix-packages input.
+
+name: Update flake.lock
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 21 * * 5' # Saturdays 06:00 JST
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Update flake.lock and open PR
+        # The subject is pinned: commitlint.config.mjs exempts exactly it.
+        uses: DeterminateSystems/update-flake-lock@v29
+        with:
+          pr-title: 'chore(deps): update flake.lock'
+          pr-labels: dependencies
+          commit-msg: 'chore(deps): update flake.lock'
