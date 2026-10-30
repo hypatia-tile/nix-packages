@@ -1,1 +1,2 @@
 # Runtime deferrals read by vulns: name@version<TAB>until<TAB>reason.
+python@3.14.8	2026-11-07	3.14.10 (NixOS/nixpkgs#580027) is in staging-next (NixOS/nixpkgs#580394), not in nixpkgs-unstable yet; same finding as dotfiles-mac#298
