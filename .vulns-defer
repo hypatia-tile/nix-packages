@@ -1,2 +1,5 @@
-# Runtime deferrals read by vulns: name@version<TAB>until<TAB>reason.
+# Runtime deferrals, read by vulns: name@version<TAB>until<TAB>reason.
+# They cover this repository's devShell, and the runtimes installed on hosts
+# that import it, which dotfiles-mac's vulns host reads.
 python@3.14.8	2026-11-07	3.14.10 (NixOS/nixpkgs#580027) is in staging-next (NixOS/nixpkgs#580394), not in nixpkgs-unstable yet; same finding as dotfiles-mac#298
+nodejs@24.21.0	2026-11-13	24.22.1 (NixOS/nixpkgs#576777) is in staging-next (NixOS/nixpkgs#580394), not in nixpkgs-unstable yet; on the host, read by dotfiles-mac's vulns host (#5)
