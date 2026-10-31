@@ -1,6 +1,6 @@
 # 0003. Check the modules in a minimal system
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-29
 
 ## Context

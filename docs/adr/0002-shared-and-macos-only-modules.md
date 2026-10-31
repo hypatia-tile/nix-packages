@@ -1,6 +1,6 @@
 # 0002. Shared and macOS-only modules, with an explicit order
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-29
 
 ## Context
