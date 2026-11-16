@@ -123,6 +123,12 @@
     copilot-language-server
     claude-code
     codex
+    # The Agent Client Protocol (ACP) adapters for claude-code and codex, for
+    # Emacs's agent-shell. agent-shell's own configuration lives in the
+    # owner's Emacs repository (hypatia-tile/emacs-mac), not here. cursor-cli
+    # has no ACP adapter in nixpkgs, so Cursor's agent is left out.
+    claude-agent-acp
+    codex-acp
     # Cursor's terminal agent (the `cursor-agent` binary), on trial. The GUI
     # editor is the `cursor` cask in modules/darwin/homebrew.nix here
     # (dotfiles-mac ADR 0005). Like claude-code and codex, this moves only
